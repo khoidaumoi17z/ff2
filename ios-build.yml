@@ -1,0 +1,104 @@
+name: Build Inspector IPA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Unpack source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f VNBAPEX-Inspector-source.zip
+          unzip -q VNBAPEX-Inspector-source.zip -d ci-source
+
+      - name: Show build environment and validate project
+        working-directory: ci-source/VNBAPEX-Inspector
+        run: |
+          xcodebuild -version
+          python3 tools/verify_project.py
+          bash -n build.sh
+
+      - name: Select available iPhone simulator
+        id: simulator
+        working-directory: ci-source/VNBAPEX-Inspector
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun simctl list devices available --json > /tmp/vnbapex-simulators.json
+          python3 - <<'PY'
+          import json, os
+          with open('/tmp/vnbapex-simulators.json') as f:
+              devices = json.load(f)['devices']
+          candidates = [d for runtime, values in devices.items()
+                        if '.iOS-' in runtime
+                        for d in values
+                        if d.get('isAvailable') and d['name'].startswith('iPhone')]
+          if not candidates:
+              raise SystemExit('No available iPhone simulator for the selected Xcode.')
+          simulator_id = candidates[0]['udid']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('udid=' + simulator_id + '\n')
+          print('Selected:', candidates[0]['name'], simulator_id)
+          PY
+
+      - name: Run unit tests
+        working-directory: ci-source/VNBAPEX-Inspector
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash build.sh test "${{ steps.simulator.outputs.udid }}" 2>&1 | tee test.log
+
+      - name: Build and package unsigned IPA
+        working-directory: ci-source/VNBAPEX-Inspector
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash build.sh archive-unsigned 2>&1 | tee archive.log
+
+      - name: Check packaged bundle
+        working-directory: ci-source/VNBAPEX-Inspector
+        run: |
+          python3 - <<'PY'
+          import plistlib, zipfile
+          with zipfile.ZipFile('Build/Artifacts/VNBAPEXInspector-unsigned.ipa') as z:
+              assert z.testzip() is None
+              base = 'Payload/VNBAPEXInspector.app/'
+              info = plistlib.loads(z.read(base + 'Info.plist'))
+              assert info['CFBundleIdentifier'] == 'com.vnbapex.inspector'
+              binary = z.read(base + info['CFBundleExecutable'])
+              assert len(binary) > 0
+              assert binary[:4] in [bytes.fromhex(h) for h in
+                                   ['cffaedfe', 'feedfacf', 'cafebabe', 'bebafeca']]
+          print('Bundle structure checked; IPA is unsigned.')
+          PY
+
+      - name: Upload IPA and SHA-256
+        uses: actions/upload-artifact@v7
+        with:
+          name: VNBAPEXInspector-unsigned-IPA
+          path: ci-source/VNBAPEX-Inspector/Build/Artifacts/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: Inspector-build-logs
+          path: |
+            ci-source/VNBAPEX-Inspector/test.log
+            ci-source/VNBAPEX-Inspector/archive.log
+          if-no-files-found: ignore
+          retention-days: 7
